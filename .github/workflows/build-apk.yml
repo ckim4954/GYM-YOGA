@@ -17,37 +17,94 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout source
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Locate Android project
+      - name: Locate or extract Android project
         shell: bash
         run: |
           set -euo pipefail
 
-          SETTINGS_FILE=$(find . \
-            -type f \
-            \( -name "settings.gradle.kts" -o -name "settings.gradle" \) \
-            -not -path "./.git/*" \
-            -print -quit)
+          WORKSPACE="$GITHUB_WORKSPACE"
+          PROJECT_DIR=""
 
-          if [ -z "$SETTINGS_FILE" ]; then
-            echo "ERROR: Cannot find settings.gradle.kts or settings.gradle."
-            echo "Please ensure the Android source code is extracted into the repository."
-            exit 1
+          # 1. Check whether Android source already exists directly.
+          find_project() {
+            local BASE="$1"
+            local SETTINGS
+
+            SETTINGS=$(find "$BASE" \
+              -type f \
+              \( -name "settings.gradle.kts" -o -name "settings.gradle" \) \
+              -not -path "*/.git/*" \
+              -print -quit)
+
+            if [ -n "$SETTINGS" ]; then
+              local DIR
+              DIR=$(dirname "$SETTINGS")
+
+              if [ -f "$DIR/app/build.gradle.kts" ] || \
+                 [ -f "$DIR/app/build.gradle" ]; then
+                echo "$DIR"
+                return 0
+              fi
+            fi
+
+            return 1
+          }
+
+          if PROJECT_DIR=$(find_project "$WORKSPACE"); then
+            echo "Found Android project directly in repository."
+          else
+            echo "Android project not found directly. Searching ZIP files..."
+
+            mapfile -t ZIP_FILES < <(
+              find "$WORKSPACE" \
+                -type f \
+                -iname "*.zip" \
+                -not -path "*/.git/*"
+            )
+
+            if [ "${#ZIP_FILES[@]}" -eq 0 ]; then
+              echo "ERROR: No ZIP file found in repository."
+              exit 1
+            fi
+
+            EXTRACT_ROOT="$RUNNER_TEMP/android-extracted"
+            mkdir -p "$EXTRACT_ROOT"
+
+            FOUND=false
+            INDEX=0
+
+            for ZIP_FILE in "${ZIP_FILES[@]}"; do
+              INDEX=$((INDEX + 1))
+              DEST="$EXTRACT_ROOT/source-$INDEX"
+
+              echo "Extracting: $ZIP_FILE"
+              mkdir -p "$DEST"
+              unzip -q "$ZIP_FILE" -d "$DEST"
+
+              if PROJECT_DIR=$(find_project "$DEST"); then
+                FOUND=true
+                echo "Android project found in: $ZIP_FILE"
+                break
+              fi
+            done
+
+            if [ "$FOUND" != "true" ]; then
+              echo "ERROR: No valid Android Gradle project found in ZIP files."
+              exit 1
+            fi
           fi
 
-          PROJECT_DIR=$(dirname "$SETTINGS_FILE")
           PROJECT_DIR=$(realpath "$PROJECT_DIR")
 
-          if [ ! -f "$PROJECT_DIR/app/build.gradle.kts" ] && \
-             [ ! -f "$PROJECT_DIR/app/build.gradle" ]; then
-            echo "ERROR: Android app module not found in $PROJECT_DIR"
-            exit 1
-          fi
-
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Found Android project: $PROJECT_DIR"
+
+          echo "=================================="
+          echo "Android project directory:"
+          echo "$PROJECT_DIR"
+          echo "=================================="
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -71,11 +128,12 @@ jobs:
           elif command -v sdkmanager >/dev/null 2>&1; then
             SDKMANAGER="$(command -v sdkmanager)"
           else
-            echo "ERROR: sdkmanager was not found."
+            echo "ERROR: sdkmanager not found."
             exit 1
           fi
 
           yes | "$SDKMANAGER" --licenses >/dev/null || true
+
           "$SDKMANAGER" --install \
             "platforms;android-36.1" \
             "build-tools;36.0.0"
@@ -84,7 +142,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           cd "$PROJECT_DIR"
 
           if [ ! -f debug.keystore ]; then
@@ -99,7 +156,7 @@ jobs:
               -dname "CN=Android Debug,O=Android,C=US"
           fi
 
-      - name: Build APK
+      - name: Build Debug APK
         shell: bash
         run: |
           set -euo pipefail
